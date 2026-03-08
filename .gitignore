@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# Input files (project-specific PDFs - don't commit to git)
+input/registers/*.pdf
+input/pids/*.xlsx
+
+# Output files
+output/*.xlsx
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
