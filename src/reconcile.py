@@ -1,24 +1,55 @@
 """
 Cross-reference P&ID-extracted data against valve lists and equipment lists.
-Produces reconciliation DataFrames with status flags and discrepancy notes.
 
 Design principles:
-- Valve list (REG-00021/00009) is authoritative for valve status, size, spec
-- Mech equipment list (REG-00019/00018) is authoritative for equipment specs
+- Valve list is authoritative for valve status, size, spec
+- Mech equipment list is authoritative for equipment specs  
 - P&ID extraction is used for EXISTENCE checks and size/spec COMPARISON only
-- Valve position (NO/NC/LO/LC/FC) is NOT compared -- P&ID extraction of these
-  is unreliable due to ambiguity with RTIO line service codes (LO=Lube Oil,
-  FO=Fuel Oil, etc.)
+- Valve position (NO/NC/LO/LC/FC) is NOT compared (RTIO line code ambiguity)
+- VF-series drawings contain existing installation valves not in PN12442 scope
+- Size comparison normalises numeric values (25.0 == 25)
+- BART/BARF specs on VF drawings are legacy equivalents of V100/V115
 """
 import pandas as pd
+import re
+
+
+def _normalise_size(val):
+    """Normalise valve size for comparison: '25.0' -> '25', handle nan."""
+    s = str(val).strip()
+    if s in ('', 'nan', 'None'):
+        return ''
+    try:
+        f = float(s)
+        if f == int(f):
+            return str(int(f))
+        return str(f)
+    except ValueError:
+        return s
+
+
+# VF-series drawings that contain EXISTING valves (not new PN12442 scope)
+EXISTING_DRAWINGS = {
+    'HD4-2960-VF-00002',
+    'HD4-2960-VF-00003',
+    'HD4-2960-VF-00008',
+    'HD4-2900-VF-00002',
+    'HD4-2900-VF-00004',
+    'HD4-2900-VF-00008',
+    'HD4-2900-VF-00009',
+}
+
+# Legacy spec codes on VF drawings map to current V-series codes
+SPEC_EQUIVALENTS = {
+    'BART': 'V100',   # bar stock threaded ball valve
+    'BARF': 'V115',   # bar stock flanged ball valve
+    'GAVF': 'V100',   # gate valve flanged (approximate)
+    'CHVF': 'V222',   # check valve flanged
+}
 
 
 def reconcile_valves(pid_valves, valve_list_combined):
-    """
-    Compare valves found on P&IDs against the official valve list.
-    Focuses on existence and size/spec matching.
-    Valve status is carried from the list as informational only -- not compared.
-    """
+    """Compare valves on P&IDs against official valve list."""
     list_tags = set(valve_list_combined['valve_tag'].str.strip().values)
     list_lookup = {}
     for _, row in valve_list_combined.iterrows():
@@ -41,6 +72,8 @@ def reconcile_valves(pid_valves, valve_list_combined):
         list_status = ''
         list_size = ''
         list_spec = ''
+        pid_drawing = str(row.get('P&ID Drawing No.', '')).strip()
+        is_existing = pid_drawing in EXISTING_DRAWINGS
 
         if on_list:
             m = list_lookup.get(tag)
@@ -49,33 +82,38 @@ def reconcile_valves(pid_valves, valve_list_combined):
                 list_size = str(m.get('size', '')).strip()
                 list_spec = str(m.get('valve_code', '')).strip()
 
-                # Size comparison (only if both sides have data)
-                pid_size = str(row.get('Size', '')).strip()
-                if (list_size and pid_size
-                        and list_size not in ('', 'nan', 'None')
-                        and pid_size not in ('', 'nan', 'None')
-                        and list_size != pid_size):
-                    notes = f'Size mismatch: P&ID={pid_size}, List={list_size}'
+                # Size comparison (normalised)
+                pid_size = _normalise_size(row.get('Size', ''))
+                norm_list_size = _normalise_size(list_size)
+                if (norm_list_size and pid_size and norm_list_size != pid_size):
+                    notes = f'Size mismatch: P&ID={pid_size}, List={norm_list_size}'
                     status = 'MISMATCH -- REVIEW'
 
-                # Spec code comparison
+                # Spec comparison (with legacy equivalence)
                 pid_spec = str(row.get('Valve Type / Spec', '')).strip()
-                if (list_spec and pid_spec
-                        and list_spec not in ('', 'nan', 'None')
-                        and pid_spec not in ('', 'nan', 'None')
-                        and list_spec != pid_spec):
-                    spec_note = f'Spec mismatch: P&ID={pid_spec}, List={list_spec}'
-                    notes = f'{notes}; {spec_note}'.strip('; ')
-                    status = 'MISMATCH -- REVIEW'
+                if pid_spec in ('', 'nan', 'None') or list_spec in ('', 'nan', 'None'):
+                    pass
+                else:
+                    # Normalise legacy specs before comparing
+                    pid_spec_norm = SPEC_EQUIVALENTS.get(pid_spec, pid_spec)
+                    list_spec_norm = SPEC_EQUIVALENTS.get(list_spec, list_spec)
+                    if pid_spec_norm != list_spec_norm:
+                        spec_note = f'Spec mismatch: P&ID={pid_spec}, List={list_spec}'
+                        notes = f'{notes}; {spec_note}'.strip('; ')
+                        status = 'MISMATCH -- REVIEW'
+
+        elif is_existing:
+            status = 'EXISTING (not in PN12442 scope)'
+            notes = f'Existing valve on {pid_drawing} -- not expected on PN12442 valve list'
         else:
             status = 'MISSING FROM VALVE LIST'
             notes = 'On P&ID but not found on valve list -- confirm with design team'
 
         results.append({
             'valve_tag': tag,
-            'pid_size': str(row.get('Size', '')),
+            'pid_size': _normalise_size(row.get('Size', '')),
             'pid_spec': str(row.get('Valve Type / Spec', '')),
-            'pid_drawing': str(row.get('P&ID Drawing No.', '')),
+            'pid_drawing': pid_drawing,
             'pid_description': str(row.get('P&ID Description', '')),
             'list_size': list_size,
             'list_spec': list_spec,
@@ -85,7 +123,7 @@ def reconcile_valves(pid_valves, valve_list_combined):
             'discrepancy_notes': notes,
         })
 
-    # Valves on list but NOT found in P&ID extraction
+    # Valves on list but NOT in P&ID extraction
     for _, row in valve_list_combined.iterrows():
         tag = row['valve_tag'].strip()
         if tag not in pid_tags_seen:
@@ -110,14 +148,9 @@ def reconcile_valves(pid_valves, valve_list_combined):
 
 
 def reconcile_equipment(pid_equip, equip_list_combined):
-    """
-    Compare equipment found on P&IDs against the official equipment list.
-    Handles tag naming convention differences (PRV-00x vs BD2947.PRVxxx)
-    and separates instrument items from mechanical items.
-    """
+    """Compare equipment on P&IDs against official equipment list."""
     list_tags = set(equip_list_combined['equip_tag'].str.strip().values)
 
-    # Build lookup for PRV tag convention matching
     prv_map = {}
     for tag in list_tags:
         if '.PRV' in tag:
@@ -125,15 +158,12 @@ def reconcile_equipment(pid_equip, equip_list_combined):
             if len(parts) == 2 and len(parts[1]) >= 3:
                 prv_map[f'PRV-{parts[1][:3]}'] = tag
 
-    # Build lookup for dryer tag convention (DRYR01 vs DY01)
     dryer_map = {}
     for tag in list_tags:
         if '.DY' in tag:
             parts = tag.split('.DY')
             if len(parts) == 2:
-                prefix = parts[0]
-                num = parts[1]
-                dryer_map[f'{prefix}.DRYR{num}'] = tag
+                dryer_map[f'{parts[0]}.DRYR{parts[1]}'] = tag
 
     instrument_prefixes = [
         '.PDT', '.FS0', '.FT0', '.FQ0', '.ESS', '.SV0', '.SV1',
@@ -150,35 +180,28 @@ def reconcile_equipment(pid_equip, equip_list_combined):
             continue
         pid_tags_seen.add(tag)
 
+        pid_drawing = str(row.get('P&ID Drawing No.', '')).strip()
+        is_existing = pid_drawing in EXISTING_DRAWINGS
         on_list = tag in list_tags
         notes = ''
         status = 'OK' if on_list else 'MISSING'
 
         if not on_list:
-            # Check PRV naming convention
             if tag.startswith('PRV-') and tag in prv_map:
                 status = 'TAG MISMATCH'
-                notes = (
-                    f'P&ID uses "{tag}", equip list uses "{prv_map[tag]}" '
-                    f'-- same item, confirm tag convention with design team'
-                )
+                notes = f'P&ID="{tag}", List="{prv_map[tag]}" -- confirm tag convention'
             elif tag.endswith(')') and 'Dome' in tag:
                 status = 'TAG MISMATCH'
                 notes = 'Dome shelter item -- check tag convention against REG-00018'
-            # Check dryer naming convention
             elif tag in dryer_map:
                 status = 'TAG MISMATCH'
-                notes = (
-                    f'P&ID uses "{tag}", equip list uses "{dryer_map[tag]}" '
-                    f'-- same item, confirm tag convention'
-                )
-            # Check if instrument/control item
+                notes = f'P&ID="{tag}", List="{dryer_map[tag]}" -- confirm tag convention'
             elif any(prefix in tag for prefix in instrument_prefixes):
                 status = 'INSTRUMENT (not on mech list)'
-                notes = (
-                    'Instrument/control item -- expected on I&C instrument '
-                    'index rather than mechanical equipment list'
-                )
+                notes = 'Instrument/control item -- expected on I&C instrument index'
+            elif is_existing:
+                status = 'EXISTING (not in PN12442 scope)'
+                notes = f'Existing equipment on {pid_drawing}'
             else:
                 notes = 'On P&ID but not found on mechanical equipment list'
 
@@ -186,13 +209,12 @@ def reconcile_equipment(pid_equip, equip_list_combined):
             'equip_tag': tag,
             'pid_description': str(row.get('Description', '')),
             'pid_type': str(row.get('Type / Service', '')),
-            'pid_drawing': str(row.get('P&ID Drawing No.', '')),
+            'pid_drawing': pid_drawing,
             'on_equip_list': 'Y' if on_list else 'N',
             'status': status,
             'discrepancy_notes': notes,
         })
 
-    # Equipment on list but NOT in P&ID extraction
     for _, row in equip_list_combined.iterrows():
         tag = row['equip_tag'].strip()
         if tag not in pid_tags_seen:
@@ -204,8 +226,7 @@ def reconcile_equipment(pid_equip, equip_list_combined):
                 'on_equip_list': 'Y',
                 'status': 'EXTRA (on list, not in P&ID extract)',
                 'discrepancy_notes': (
-                    f'On {row["source_doc"]} -- may be non-P&ID item '
-                    f'(boom gate, fire extinguisher, etc.) or extraction miss'
+                    f'On {row["source_doc"]} -- may be non-P&ID item or extraction miss'
                 ),
             })
 
